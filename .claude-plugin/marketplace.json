@@ -1,0 +1,12 @@
+{
+  "name": "samgosah-ai",
+  "owner": { "name": "samgosah" },
+  "metadata": { "description": "Claude Code mods by samgosah." },
+  "plugins": [
+    {
+      "name": "prompt-master",
+      "source": "./mods/prompt-master",
+      "description": "Rewrites a rough prompt into a clear, well-structured one before it is sent."
+    }
+  ]
+}
