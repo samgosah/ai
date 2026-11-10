@@ -1,95 +1,110 @@
-import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface as Engine, Register } from 'claude-code'
 
-import type { Status, Undo } from '../types'
-
-const status = atom({ plugin: 'prompt-master', key: 'status' } as const, 'idle' as Status)
-const undo = atom({ plugin: 'prompt-master', key: 'undo' } as const, null as Undo)
-
-const SYSTEM = `You are Prompt Master. You rewrite a user's rough prompt for an AI coding/assistant agent into a better prompt.
+const SYSTEM = `You are Prompt Master. Rewrite the user's rough prompt into a better prompt for an AI coding assistant.
 Rules:
 - Keep the user's intent, facts, names, paths and constraints exactly. Never invent requirements.
-- Make the goal explicit up front, then context, constraints, and what "done" looks like.
-- Fix grammar and ambiguity; split run-ons into short bullets where it helps.
-- If something essential is unclear, add one line at the end starting "Ask me first if:" listing it.
-- Stay concise: no fluff, no preamble, no role-play lines like "You are an expert".
-- Output ONLY the rewritten prompt text, nothing else.`
+- Make the goal explicit, add relevant context the user implied, state the expected output and what "done" looks like.
+- Use short sections or bullets only when the task has several parts; keep simple asks to one or two sentences.
+- Write in the user's voice (first person), in American English.
+- Output ONLY the rewritten prompt. No preamble, no quotes, no commentary.`
 
-async function rewrite($: EngineInterface, given?: string): Promise<string> {
-  if ((await read($, status)) === 'working') return 'Prompt Master is already running.'
-  const draft = (given ?? (await $.prompt.read()).text).trim()
-  if (!draft) {
-    $.ui.toast('Type a rough prompt first, then hit Prompt Master.')
-    return 'Nothing to rewrite.'
-  }
-  await update($, status, () => 'working')
+// Typing "pm: <rough prompt>" rewrites it and sends the rewrite in one step.
+const PREFIX = /^\s*pm:\s*/i
+
+let isBusy = false
+let original: string | null = null
+
+async function rewrite($: Engine, rough: string) {
   try {
     const r = await $.model.complete({
       model: 'sonnet',
       system: SYSTEM,
-      prompt: `Rewrite this rough prompt:\n\n<rough_prompt>\n${draft}\n</rough_prompt>`,
+      prompt: rough,
       maxTokens: 2000,
-      timeoutMs: 60000,
+      timeoutMs: 60_000,
     })
-    if (!r.isAnswered) {
-      $.ui.toast(`Prompt Master failed: ${r.reason}`)
-      return `Rewrite failed: ${r.reason}`
-    }
-    const text = r.text.trim().replace(/^<\/?rough_prompt>|<\/?rough_prompt>$/g, '').trim()
-    await update($, undo, () => draft)
-    const filled = await $.prompt.fill({ text, mode: 'replace' })
-    if (!filled.isFilled) return text
-    $.ui.toast('Prompt rewritten. Review it, then send.')
-    return 'Rewritten prompt is in the box.'
-  } finally {
-    await update($, status, () => 'idle')
+    return r.isAnswered && r.text.trim() ? r.text.trim() : undefined
+  } catch {
+    return undefined
   }
+}
+
+// One click: the button above the prompt rewrites the draft in place.
+async function improveDraft($: Engine) {
+  if (isBusy) return
+  const box = await $.prompt.read()
+  if (!box.text.trim()) {
+    $.ui.toast('Prompt Master: type a rough prompt first')
+    return
+  }
+  isBusy = true
+  $.ui.status('Prompt Master: rewriting…')
+  try {
+    const better = await rewrite($, box.text)
+    if (!better) {
+      $.ui.toast('Prompt Master: rewrite failed, draft left as is')
+      return
+    }
+    const filled = await $.prompt.fill({ text: better, cursor: better.length })
+    if (filled.isFilled) original = box.text
+    $.ui.toast(filled.isFilled ? 'Prompt Master: draft rewritten, review and send' : 'Prompt Master: could not write to the prompt box')
+  } finally {
+    isBusy = false
+    $.ui.status(undefined)
+  }
+}
+
+async function undo($: Engine) {
+  if (original === null) return
+  const text = original
+  original = null
+  await $.prompt.fill({ text, cursor: text.length })
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
-      name: 'prompt-master',
-      description: 'Rewrite your rough prompt (or the text after the command) into a better one',
+      name: 'pm',
+      description: 'Prompt Master: rewrite a rough prompt, then put it in the box (or send it)',
     })
     return next(e)
   })
 
-  on('command.run', { command: 'prompt-master' }, async ($, e) => {
-    const text = await rewrite($, e.args.trim() || undefined)
-    return { text }
-  })
-
-  // A sent prompt clears the undo copy.
-  on('prompt.submit', ($, e, next) => {
-    void update($, undo, () => null).catch(() => {})
-    return next(e)
-  })
-
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
-    const { Box, Button, Text } = $.ui.resolve(e)
-    const s = await read($, status)
-    const prev = await read($, undo)
+    if (e.props.hasSurvey || e.props.isWorking) return next(e)
+    const { Box, Button } = $.ui.resolve(e)
     return (
-      <Box flexDirection="row" gap={1}>
-        <Button
-          key="pm"
-          label={s === 'working' ? '✨ Rewriting…' : '✨ Prompt Master'}
-          onPress={() => { void rewrite($) }}
-        />
-        {prev !== null && s === 'idle' ? (
-          <Button
-            key="undo"
-            label="Undo"
-            onPress={async () => {
-              await $.prompt.fill({ text: prev, mode: 'replace' })
-              await update($, undo, () => null)
-            }}
-          />
-        ) : null}
-        {s === 'working' ? <Text dimColor>polishing your prompt</Text> : null}
+      <Box>
+        <Button key="pm" label="✨ Prompt Master" onPress={() => improveDraft($)} />
+        {original !== null ? <Button key="undo" label="Undo" onPress={() => undo($)} /> : null}
       </Box>
     )
+  })
+
+  // /pm <rough>: fill the box for review; where the app owns the box, send it.
+  on('command.run', { command: 'pm' }, async ($, e) => {
+    const rough = e.args.trim()
+    if (!rough) {
+      await improveDraft($)
+      return { text: 'Prompt Master: usage `/pm <rough prompt>`, or press the ✨ button.' }
+    }
+    const better = await rewrite($, rough)
+    if (!better) return { text: 'Prompt Master: rewrite failed. Your prompt was not sent.' }
+    const filled = await $.prompt.fill({ text: better, cursor: better.length })
+    if (filled.isFilled) return { text: 'Prompt Master: rewritten prompt is in the box. Edit if needed, then send.' }
+    void $.prompt.submit({ text: better, asUser: true })
+    return { text: `Prompt Master rewrote your prompt:\n\n${better}` }
+  })
+
+  // "pm: <rough>": rewrite and send in one step; works on every surface, phone included.
+  on('prompt.submit', ($, e, next) => {
+    if (e.command || e.isMeta || !PREFIX.test(e.text)) return next(e)
+    const rough = e.text.replace(PREFIX, '')
+    return rewrite($, rough)
+      .then(better => {
+        if (!better) $.ui.toast('Prompt Master: rewrite failed, sent your original')
+        return next({ ...e, text: better ?? rough })
+      })
+      .catch(() => next({ ...e, text: rough }))
   })
 }
